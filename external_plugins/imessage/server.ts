@@ -149,21 +149,23 @@ const qAttachments = db.query<AttRow, [number]>(`
   WHERE maj.message_id = ?
 `)
 
-// Your own addresses. message.account ("E:you@icloud.com" / "p:+1555...") is
-// the identity you sent *from* on each row — but an Apple ID can be reachable
-// at both an email and a phone, and account only shows whichever you sent
-// from. chat.last_addressed_handle covers the rest: it's the per-chat "which
-// of your addresses reaches this person" field, so it accumulates every
-// identity you've actually used. Union both.
+// Your own addresses, from message.account ("E:you@icloud.com" / "p:+1555...")
+// on rows you sent. This is the identity you sent *from*. If your Apple ID is
+// reachable at an address you've never sent from, it won't appear here — send
+// one message from that identity to register it.
+//
+// DO NOT use chat.last_addressed_handle. Despite its docstring ("which of your
+// addresses reaches this person"), on machines with SMS history it returns a
+// polluted mix of short codes, business handles, and other contacts' numbers.
+// See anthropics/claude-plugins-official#1010: one user's last_addressed_handle
+// query returned 50 addresses, only 2 of which were actually theirs, and the
+// permission-relay handler spammed 148 DM chats.
 const SELF = new Set<string>()
 {
   type R = { addr: string }
   const norm = (s: string) => (/^[A-Za-z]:/.test(s) ? s.slice(2) : s).toLowerCase()
   for (const { addr } of db.query<R, []>(
     `SELECT DISTINCT account AS addr FROM message WHERE is_from_me = 1 AND account IS NOT NULL AND account != '' LIMIT 50`,
-  ).all()) SELF.add(norm(addr))
-  for (const { addr } of db.query<R, []>(
-    `SELECT DISTINCT last_addressed_handle AS addr FROM chat WHERE last_addressed_handle IS NOT NULL AND last_addressed_handle != '' LIMIT 50`,
   ).all()) SELF.add(norm(addr))
 }
 process.stderr.write(`imessage channel: self-chat addresses: ${[...SELF].join(', ') || '(none)'}\n`)
@@ -496,11 +498,10 @@ const mcp = new Server(
       tools: {},
       experimental: {
         'claude/channel': {},
-        // Permission-relay opt-in (anthropics/claude-cli-internal#23061).
-        // Declaring this asserts we authenticate the replier — which we do:
-        // gate()/access.allowFrom already drops non-allowlisted senders before
-        // handleInbound delivers. Self-chat is the owner by definition. A
-        // server that can't authenticate the replier should NOT declare this.
+        // Permission-relay opt-in. Declaring this asserts we authenticate the
+        // replier — which we do: prompts go to self-chat only and replies are
+        // accepted from self-chat only (see handleInbound). A server that
+        // can't authenticate the replier should NOT declare this.
         'claude/channel/permission': {},
       },
     },
@@ -518,11 +519,13 @@ const mcp = new Server(
   },
 )
 
-// Receive permission_request from CC → format → send to all allowlisted DMs.
-// Groups are intentionally excluded — the security thread resolution was
-// "single-user mode for official plugins." Anyone in access.allowFrom
-// already passed explicit pairing; group members haven't. Self-chat is
-// always included (owner).
+// Receive permission_request from CC → format → send to the owner's self-chat.
+//
+// Self-chat ONLY. Not allowFrom, not groups. A permission reply grants tool
+// execution on the owner's machine — that authority belongs to the owner
+// alone. Allowlisted contacts can chat with Claude but must not be able to
+// approve Bash commands on someone else's laptop.
+// See anthropics/claude-plugins-official#1048, #1010.
 mcp.setNotificationHandler(
   z.object({
     method: z.literal('notifications/claude/channel/permission_request'),
@@ -535,7 +538,6 @@ mcp.setNotificationHandler(
   }),
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
-    const access = loadAccess()
     // input_preview is unbearably long for Write/Edit; show only for Bash
     // where the command itself is the dangerous part.
     const preview = tool_name === 'Bash' ? `${input_preview}\n\n` : '\n'
@@ -544,13 +546,16 @@ mcp.setNotificationHandler(
       `${tool_name}: ${description}\n` +
       preview +
       `Reply "yes ${request_id}" to allow or "no ${request_id}" to deny.`
-    // allowFrom holds handle IDs, not chat GUIDs — resolve via qChatsForHandle.
-    // Include SELF addresses so the owner's self-chat gets the prompt even
-    // when allowFrom is empty (default config).
-    const handles = new Set([...access.allowFrom.map(h => h.toLowerCase()), ...SELF])
     const targets = new Set<string>()
-    for (const h of handles) {
+    for (const h of SELF) {
       for (const { guid } of qChatsForHandle.all(h)) targets.add(guid)
+    }
+    if (targets.size === 0) {
+      process.stderr.write(
+        `imessage channel: permission_request ${request_id} not relayed — no self-chat found. ` +
+        `Send yourself an iMessage to create one.\n`,
+      )
+      return
     }
     for (const guid of targets) {
       const err = sendText(guid, text)
@@ -758,10 +763,10 @@ function handleInbound(r: Row): void {
 
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
-  // relaying as chat. The sender is already gate()-approved at this point
-  // (non-allowlisted senders were dropped above; self-chat is the owner),
-  // so we trust the reply.
-  const permMatch = PERMISSION_REPLY_RE.exec(text)
+  // relaying as chat. Self-chat ONLY — mirrors the self-chat-only send
+  // side above. Allowlisted contacts can chat but cannot approve tool
+  // execution on the owner's machine.
+  const permMatch = isSelfChat ? PERMISSION_REPLY_RE.exec(text) : null
   if (permMatch) {
     void mcp.notification({
       method: 'notifications/claude/channel/permission',
