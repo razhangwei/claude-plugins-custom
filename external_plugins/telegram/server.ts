@@ -703,6 +703,7 @@ bot.command('help', async ctx => {
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
     `/status — check your pairing state\n` +
+    `/new — save session summary and start fresh\n` +
     `/clear — clear conversation context\n` +
     `/compact — compress conversation context\n` +
     `/context — show context window usage\n` +
@@ -756,6 +757,19 @@ bot.command('compact', async ctx => {
     execSync(`tmux send-keys -t ${TMUX_SESSION} '/compact' Enter`, { timeout: 5000 })
   } catch (err) {
     process.stderr.write(`telegram channel: /compact tmux send failed: ${err}\n`)
+  }
+})
+
+bot.command('new', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  const senderId = String(ctx.from?.id)
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) return
+  await ctx.reply('Saving session and resetting ✓')
+  try {
+    execSync(`tmux send-keys -t ${TMUX_SESSION} '/session-save' Enter`, { timeout: 5000 })
+  } catch (err) {
+    process.stderr.write(`telegram channel: /new tmux send failed: ${err}\n`)
   }
 })
 
@@ -1100,6 +1114,7 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              { command: 'new', description: 'Save session summary and start fresh' },
               { command: 'clear', description: 'Clear conversation context' },
               { command: 'compact', description: 'Compress conversation context' },
               { command: 'context', description: 'Show context window usage' },
