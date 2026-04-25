@@ -817,9 +817,17 @@ bot.command('context', async ctx => {
   if (!access.allowFrom.includes(senderId)) return
   try {
     const pane = execSync(`tmux capture-pane -t ${TMUX_SESSION} -p`, { timeout: 5000, encoding: 'utf8' })
-    // Status line is at the bottom of the pane — search last 5 lines only
-    const tail = pane.split('\n').slice(-5)
-    const ctxLine = tail.find(l => l.includes('ctx:'))
+    // Status line lives near the bottom but can shift after /clear (welcome banner,
+    // hook output, hint lines). Scan the last 25 lines bottom-up for a real
+    // `ctx: N% used` status; the last match is the live status bar.
+    const tail = pane.split('\n').slice(-25)
+    let ctxLine: string | undefined
+    for (let i = tail.length - 1; i >= 0; i--) {
+      if (/ctx:\s*\d+%\s*used/.test(tail[i])) {
+        ctxLine = tail[i]
+        break
+      }
+    }
     await ctx.reply(ctxLine?.trim() || 'Could not read context from session.')
   } catch {
     await ctx.reply('Session not found.')
