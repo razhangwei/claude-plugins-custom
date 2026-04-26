@@ -847,15 +847,17 @@ bot.command('context', async ctx => {
   const access = loadAccess()
   if (!access.allowFrom.includes(senderId)) return
   try {
-    const pane = execSync(`tmux capture-pane -t ${TMUX_SESSION} -p`, { timeout: 5000, encoding: 'utf8' })
-    // Status line lives near the bottom but can shift after /clear (welcome banner,
-    // hook output, hint lines). Scan the last 25 lines bottom-up for a real
-    // `ctx: N% used` status; the last match is the live status bar.
-    const tail = pane.split('\n').slice(-25)
+    // Pull scroll history too — after /clear, the welcome banner and hook output
+    // can briefly push the status line off the visible viewport.
+    const pane = execSync(`tmux capture-pane -t ${TMUX_SESSION} -p -S -100`, { timeout: 5000, encoding: 'utf8' })
+    // Status line shows `ctx: N% used`, but post-/clear the value can render as
+    // `<1%`, so the digit class alone is too narrow. Scan bottom-up; the last
+    // match is the live status bar.
+    const lines = pane.split('\n')
     let ctxLine: string | undefined
-    for (let i = tail.length - 1; i >= 0; i--) {
-      if (/ctx:\s*\d+%\s*used/.test(tail[i])) {
-        ctxLine = tail[i]
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (/ctx:\s*[<>]?\d+%\s*used/.test(lines[i])) {
+        ctxLine = lines[i]
         break
       }
     }
