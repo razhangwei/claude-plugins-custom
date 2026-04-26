@@ -847,19 +847,24 @@ bot.command('context', async ctx => {
   const access = loadAccess()
   if (!access.allowFrom.includes(senderId)) return
   try {
-    // Pull scroll history too — after /clear, the welcome banner and hook output
-    // can briefly push the status line off the visible viewport.
-    const pane = execSync(`tmux capture-pane -t ${TMUX_SESSION} -p -S -100`, { timeout: 5000, encoding: 'utf8' })
-    // Status line shows `ctx: N% used`, but post-/clear the value can render as
-    // `<1%`, so the digit class alone is too narrow. Scan bottom-up; the last
-    // match is the live status bar.
-    const lines = pane.split('\n')
+    // Status line shows `ctx: N% used`. Right after /clear the welcome banner
+    // and hook output briefly cover the bar, so poll a few times instead of
+    // grabbing one stale frame. Pull scroll history (-S -100) so the line is
+    // still in range even when pushed off the visible viewport. The `<1%`
+    // post-/clear case means we accept `<` or `>` prefixes too.
+    const CTX_RE = /ctx:\s*[<>]?\d+%\s*used/
     let ctxLine: string | undefined
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (/ctx:\s*[<>]?\d+%\s*used/.test(lines[i])) {
-        ctxLine = lines[i]
-        break
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const pane = execSync(`tmux capture-pane -t ${TMUX_SESSION} -p -S -100`, { timeout: 5000, encoding: 'utf8' })
+      const lines = pane.split('\n')
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (CTX_RE.test(lines[i])) {
+          ctxLine = lines[i]
+          break
+        }
       }
+      if (ctxLine) break
+      await new Promise(r => setTimeout(r, 75))
     }
     await ctx.reply(ctxLine?.trim() || 'Could not read context from session.')
   } catch {
