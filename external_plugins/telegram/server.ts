@@ -55,6 +55,37 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
+// Process-ancestry guard. A teammate / sub-agent claude inherits the plugin
+// loader, spawns its own `bun server.ts`, and would race the orchestrator's
+// poller for the bot token — the kill-stale-holder block below would then
+// SIGTERM the orchestrator's bun, dropping its MCP pipe (anthropics/claude-code#38098).
+// Only the claude that was launched with --dangerously-load-development-channels
+// (or future --channels) targeting this plugin should poll; everyone else exits
+// cleanly. Override with TELEGRAM_FORCE_POLL=1 for direct invocation.
+function ancestryHasChannelFlag(): boolean {
+  let pid = process.ppid
+  for (let i = 0; i < 30 && pid > 1; i++) {
+    let cmd = ''
+    let ppid = 0
+    try {
+      const out = execSync(`ps -p ${pid} -o ppid=,command=`, { encoding: 'utf8' }).trim()
+      const m = out.match(/^\s*(\d+)\s+(.*)$/)
+      if (!m) break
+      ppid = parseInt(m[1], 10)
+      cmd = m[2]
+    } catch { break }
+    if (/--(?:dangerously-load-development-channels|channels)\b[^|]*\btelegram(?:@|\b)/.test(cmd)) {
+      return true
+    }
+    pid = ppid
+  }
+  return false
+}
+if (process.env.TELEGRAM_FORCE_POLL !== '1' && !ancestryHasChannelFlag()) {
+  process.stderr.write(`telegram channel: skipping poll (no --dangerously-load-development-channels in ancestry — teammate / sub-agent context)\n`)
+  process.exit(0)
+}
+
 // Telegram allows exactly one getUpdates consumer per token. If a previous
 // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
 // survive as an orphan and hold the slot forever, so every new session sees
