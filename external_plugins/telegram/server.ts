@@ -409,8 +409,11 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 }
 
 // .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
+// audio extensions can go as voice notes when as_voice=true (sendVoice strictly
+// wants opus-in-ogg; other formats may be rejected by Telegram);
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
+const AUDIO_EXTS = new Set(['.ogg', '.oga', '.opus', '.mp3', '.m4a', '.wav'])
 
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
@@ -482,7 +485,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents. Set as_voice=true to send audio attachments as native Telegram voice notes (round-bubble UX) instead of audio documents — works best with opus .ogg.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -495,12 +498,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
+            description: 'Absolute file paths to attach. Images send as photos (inline preview); audio sends as a voice note when as_voice=true, otherwise as a document. Max 50MB each.',
           },
           format: {
             type: 'string',
             enum: ['text', 'markdownv2'],
             description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+          },
+          as_voice: {
+            type: 'boolean',
+            description: "Send audio attachments via sendVoice (native voice-note bubble) instead of sendDocument. Telegram strictly requires opus-in-ogg for sendVoice; mp3/m4a/wav may be rejected. Non-audio files are unaffected. Default: false.",
           },
         },
         required: ['chat_id', 'text'],
@@ -562,6 +569,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const asVoice = args.as_voice === true
 
         assertAllowedChat(chat_id)
 
@@ -609,6 +617,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             : undefined
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
+            sentIds.push(sent.message_id)
+          } else if (asVoice && AUDIO_EXTS.has(ext)) {
+            const sent = await bot.api.sendVoice(chat_id, input, opts)
             sentIds.push(sent.message_id)
           } else {
             const sent = await bot.api.sendDocument(chat_id, input, opts)
@@ -737,6 +748,7 @@ bot.command('help', async ctx => {
     `/new — save session summary and start fresh\n` +
     `/clear — clear conversation context\n` +
     `/compact — compress conversation context\n` +
+    `/stop — interrupt the in-flight task\n` +
     `/context — show context window usage\n` +
     `/usage — show API usage quotas`
   )
@@ -801,6 +813,19 @@ bot.command('new', async ctx => {
     execSync(`tmux send-keys -t ${TMUX_SESSION} '/session-save' Enter`, { timeout: 5000 })
   } catch (err) {
     process.stderr.write(`telegram channel: /new tmux send failed: ${err}\n`)
+  }
+})
+
+bot.command('stop', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  const senderId = String(ctx.from?.id)
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) return
+  await ctx.reply('Stopped ✓')
+  try {
+    execSync(`tmux send-keys -t ${TMUX_SESSION} Escape`, { timeout: 5000 })
+  } catch (err) {
+    process.stderr.write(`telegram channel: /stop tmux send failed: ${err}\n`)
   }
 })
 
@@ -1163,6 +1188,7 @@ void (async () => {
               { command: 'new', description: 'Save session summary and start fresh' },
               { command: 'clear', description: 'Clear conversation context' },
               { command: 'compact', description: 'Compress conversation context' },
+              { command: 'stop', description: 'Interrupt the in-flight task' },
               { command: 'context', description: 'Show context window usage' },
               { command: 'usage', description: 'Show API usage quotas' },
             ],
