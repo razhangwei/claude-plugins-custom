@@ -838,22 +838,47 @@ bot.command('context', async ctx => {
     // and hook output briefly cover the bar, so poll a few times instead of
     // grabbing one stale frame. Pull scroll history (-S -100) so the line is
     // still in range even when pushed off the visible viewport. The `<1%`
-    // post-/clear case means we accept `<` or `>` prefixes too.
-    const CTX_RE = /ctx:\s*[<>]?\d+%\s*used/
+    // post-/clear case means we accept `<` or `>` prefixes too. When the
+    // tmux pane is narrow (e.g. teammate sidebar squeezing the main pane to
+    // ~24 cols), Claude Code's TUI truncates the status bar — `ctx: 51% used`
+    // becomes `ctx: 51% …` — so the trailing `used` is optional.
+    //
+    // On failure, surface a specific reason instead of the generic
+    // "Could not read context from session". The last `ctx:` fragment
+    // captured (if any) makes truncation / format-drift visible from
+    // Telegram without needing to attach to the tmux session.
+    const CTX_RE = /ctx:\s*[<>]?\d+%(\s*used)?/
     let ctxLine: string | undefined
+    let lastCtxFragment: string | undefined
+    let lastNonEmptyLine: string | undefined
     for (let attempt = 0; attempt < 8; attempt++) {
       const pane = execSync(`tmux capture-pane -t ${TMUX_SESSION} -p -S -100`, { timeout: 5000, encoding: 'utf8' })
       const lines = pane.split('\n')
       for (let i = lines.length - 1; i >= 0; i--) {
-        if (CTX_RE.test(lines[i])) {
-          ctxLine = lines[i]
+        const line = lines[i]
+        if (CTX_RE.test(line)) {
+          ctxLine = line
           break
+        }
+        if (!lastCtxFragment && line.includes('ctx:')) {
+          lastCtxFragment = line.trim()
+        }
+        if (!lastNonEmptyLine && line.trim()) {
+          lastNonEmptyLine = line.trim()
         }
       }
       if (ctxLine) break
       await new Promise(r => setTimeout(r, 75))
     }
-    await ctx.reply(ctxLine?.trim() || 'Could not read context from session.')
+    if (ctxLine) {
+      await ctx.reply(ctxLine.trim())
+    } else if (lastCtxFragment) {
+      await ctx.reply(`Saw 'ctx:' but couldn't parse %. Last line: ${lastCtxFragment}`)
+    } else if (lastNonEmptyLine) {
+      await ctx.reply(`No status bar in pane. Last line: ${lastNonEmptyLine.slice(0, 80)}`)
+    } else {
+      await ctx.reply('Pane is empty — TUI may not have rendered yet.')
+    }
   } catch {
     await ctx.reply('Session not found.')
   }
