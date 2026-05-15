@@ -44,6 +44,8 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 const TMUX_SESSION = process.env.CLAUDE_TMUX_SESSION ?? 'claude-code-telegram'
 
+const EFFORT_LEVELS = ['off', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
 if (!TOKEN) {
   process.stderr.write(
     `telegram channel: TELEGRAM_BOT_TOKEN required\n` +
@@ -53,53 +55,15 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-const PID_FILE = join(STATE_DIR, 'bot.pid')
 
-// Process-ancestry guard. A teammate / sub-agent claude inherits the plugin
-// loader, spawns its own `bun server.ts`, and would race the orchestrator's
-// poller for the bot token — the kill-stale-holder block below would then
-// SIGTERM the orchestrator's bun, dropping its MCP pipe (anthropics/claude-code#38098).
-// Only the claude that was launched with --dangerously-load-development-channels
-// (or future --channels) targeting this plugin should poll; everyone else exits
-// cleanly. Override with TELEGRAM_FORCE_POLL=1 for direct invocation.
-function ancestryHasChannelFlag(): boolean {
-  let pid = process.ppid
-  for (let i = 0; i < 30 && pid > 1; i++) {
-    let cmd = ''
-    let ppid = 0
-    try {
-      const out = execSync(`ps -p ${pid} -o ppid=,command=`, { encoding: 'utf8' }).trim()
-      const m = out.match(/^\s*(\d+)\s+(.*)$/)
-      if (!m) break
-      ppid = parseInt(m[1], 10)
-      cmd = m[2]
-    } catch { break }
-    if (/--(?:dangerously-load-development-channels|channels)\b[^|]*\btelegram(?:@|\b)/.test(cmd)) {
-      return true
-    }
-    pid = ppid
-  }
-  return false
-}
-if (process.env.TELEGRAM_FORCE_POLL !== '1' && !ancestryHasChannelFlag()) {
-  process.stderr.write(`telegram channel: skipping poll (no --dangerously-load-development-channels in ancestry — teammate / sub-agent context)\n`)
-  process.exit(0)
-}
-
-// Telegram allows exactly one getUpdates consumer per token. If a previous
-// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-// survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
+// Poll ownership is arbitrated by Telegram itself: getUpdates allows exactly
+// one consumer per bot token; concurrent callers receive 409 Conflict. So
+// every bun that loads this plugin just tries to poll — the winner serves
+// inbound messages; losers (sub-agent buns, parallel sessions, restart races)
+// drop to MCP-tools-only mode after a few retries. Outbound tools (reply,
+// react, edit_message, etc.) are pure POSTs and work regardless of poll
+// ownership. See the retry loop near the bottom of this file.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -696,9 +660,6 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
-  try {
-    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
-  } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
@@ -750,7 +711,8 @@ bot.command('help', async ctx => {
     `/compact — compress conversation context\n` +
     `/stop — interrupt the in-flight task\n` +
     `/context — show context window usage\n` +
-    `/usage — show API usage quotas`
+    `/usage — show API usage quotas\n` +
+    `/effort <level> — set thinking effort (off, low, medium, high, xhigh, max)`
   )
 })
 
@@ -895,6 +857,46 @@ bot.command('context', async ctx => {
   } catch {
     await ctx.reply('Session not found.')
   }
+})
+
+bot.command('effort', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  const senderId = String(ctx.from?.id)
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) return
+
+  const text = ctx.message?.text ?? ''
+  const parts = text.split(/\s+/)
+  const level = parts[1]?.toLowerCase()
+
+  if (!level) {
+    await ctx.reply(
+      `Usage: /effort <level>\nValid: ${EFFORT_LEVELS.join(', ')}`,
+    )
+    return
+  }
+
+  if (!(EFFORT_LEVELS as readonly string[]).includes(level)) {
+    await ctx.reply(
+      `Invalid effort level. Valid: ${EFFORT_LEVELS.join(', ')}`,
+    )
+    return
+  }
+
+  try {
+    execSync(
+      `tmux send-keys -t ${TMUX_SESSION} '/effort ${level}' Enter`,
+      { timeout: 5000 },
+    )
+  } catch (err) {
+    process.stderr.write(
+      `telegram channel: /effort tmux send failed: ${err}\n`,
+    )
+    await ctx.reply('Command failed — tmux session may be down.')
+    return
+  }
+
+  await ctx.reply(`Effort set to ${level}`)
 })
 
 // Inline-button handler for permission requests. Callback data is
@@ -1167,11 +1169,13 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
-// Retry polling with backoff on any error. Previously only 409 was retried —
-// a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
-// returned, and polling stopped permanently while the process stayed alive
-// (MCP stdin keeps it running). Outbound tools kept working but the bot was
-// deaf to inbound messages until a full restart.
+// Retry polling with backoff on transient errors (network, etc.) — keep trying
+// forever. On 409 Conflict (another bun owns the poll), retry briefly to
+// absorb restart races, then drop to MCP-tools-only mode: this bun stops
+// polling but the process stays alive and continues serving outbound tools
+// (reply/react/edit_message). That's the right behavior for sub-agent buns,
+// parallel sessions, and any other "I shouldn't be the primary poller"
+// scenario — no ancestry guessing required.
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -1191,6 +1195,7 @@ void (async () => {
               { command: 'stop', description: 'Interrupt the in-flight task' },
               { command: 'context', description: 'Show context window usage' },
               { command: 'usage', description: 'Show API usage quotas' },
+              { command: 'effort', description: 'Set thinking effort: off, low, medium, high, xhigh, max' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
@@ -1204,14 +1209,14 @@ void (async () => {
       const is409 = err instanceof GrammyError && err.error_code === 409
       if (is409 && attempt >= 8) {
         process.stderr.write(
-          `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
+          `telegram channel: 409 Conflict held after ${attempt} attempts — ` +
+          `another bun owns the poll. Dropping to MCP-tools-only mode (outbound calls still work).\n`,
         )
         return
       }
       const delay = Math.min(1000 * attempt, 15000)
       const detail = is409
-        ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
+        ? `409 Conflict${attempt === 1 ? ' — another bun is polling, retrying briefly in case it\'s a restart race' : ''}`
         : `polling error: ${err}`
       process.stderr.write(`telegram channel: ${detail}, retrying in ${delay / 1000}s\n`)
       await new Promise(r => setTimeout(r, delay))
